@@ -119,8 +119,26 @@ async function forwardToGoogleSheets(record, eventType = 'NEW_ENTRY') {
 }
 
 app.use(cors());
-app.use(express.json());
+
+// Resilient Content-Type normalization (handles 'application/json; utf-8', 'application/json; charset=utf-8', etc.)
+app.use((req, res, next) => {
+  const ct = req.headers['content-type'];
+  if (ct && (ct.includes('application/json') || ct.includes('json'))) {
+    req.headers['content-type'] = 'application/json';
+  }
+  next();
+});
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Request logger for debugging client-server sync
+app.use((req, res, next) => {
+  if (req.method !== 'GET') {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`, req.body ? JSON.stringify(req.body).substring(0, 300) : '');
+  }
+  next();
+});
 
 // --- API Endpoints ---
 
@@ -140,30 +158,35 @@ app.get('/api/movements', (req, res) => {
   res.json(movements);
 });
 
-// 2. Add or Upsert movement record
+// 2. Add or Upsert movement record (New Trip Entry)
 app.post('/api/movements', (req, res) => {
-  const { name, role, destination, purpose, outTime, latitude, longitude, id } = req.body;
-  if (!name || !destination) {
-    return res.status(400).json({ error: 'Name and destination are required.' });
-  }
+  const body = req.body || {};
+  let { name, role, destination, purpose, outTime, latitude, longitude, id } = body;
+
+  name = (name || body.staffName || 'কর্মী').trim();
+  destination = (destination || 'ফ্যাক্টরির বাহিরে').trim();
+  const rawPurpose = (body.rawPurpose || purpose || '').trim();
 
   const recordId = id || 'mov_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const existingIndex = movements.findIndex(m => m.id === recordId);
 
+  const isRet = body.isReturned === true || body.isReturned === 'true';
+  const retTime = body.returnTime && !body.returnTime.includes('এখনো') ? body.returnTime : null;
+
   const recordData = {
     id: recordId,
-    name: name.trim(),
+    name: name,
     role: (role || 'স্টাফ').trim(),
-    destination: destination.trim(),
-    purpose: (purpose || '').trim(),
+    destination: destination,
+    purpose: rawPurpose,
     outTime: outTime || new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true }),
-    returnTime: req.body.returnTime || null,
-    isReturned: Boolean(req.body.isReturned),
-    stops: req.body.stops || [],
+    returnTime: retTime,
+    isReturned: isRet,
+    stops: body.stops || [],
     latitude: latitude || null,
     longitude: longitude || null,
-    phone: req.body.phone || null,
-    mapsUrl: latitude && longitude ? `https://maps.google.com/?q=${latitude},${longitude}` : null,
+    phone: body.phone || null,
+    mapsUrl: body.mapsUrl || (latitude && longitude ? `https://maps.google.com/?q=${latitude},${longitude}` : null),
     createdAt: new Date().toISOString()
   };
 
@@ -195,41 +218,49 @@ app.post('/api/movements', (req, res) => {
     recordId: recordData.id
   });
 
-  forwardToGoogleSheets(recordData, 'NEW_ENTRY');
+  forwardToGoogleSheets(recordData, isRet ? 'RETURNED' : 'NEW_ENTRY');
 
+  console.log(`[ENTRY SAVED] ${recordData.name} -> ${recordData.destination} (isReturned=${recordData.isReturned})`);
   res.status(201).json(recordData);
 });
 
 // 3. Mark movement as returned (Upserts if not already on server)
 app.post('/api/movements/:id/return', (req, res) => {
   const id = req.params.id;
+  const body = req.body || {};
   const index = movements.findIndex(m => m.id === id);
+
+  const nowDhaka = new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true });
+  const retTime = body.returnTime && !body.returnTime.includes('এখনো') ? body.returnTime : nowDhaka;
 
   let record;
   if (index === -1) {
     record = {
       id: id,
-      name: (req.body.name || 'কর্মী').trim(),
-      role: (req.body.role || 'স্টাফ').trim(),
-      destination: (req.body.destination || 'ফ্যাক্টরির বাহিরে').trim(),
-      purpose: (req.body.rawPurpose || req.body.purpose || '').trim(),
-      outTime: req.body.outTime || new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true }),
-      returnTime: req.body.returnTime || new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true }),
+      name: (body.name || body.staffName || 'কর্মী').trim(),
+      role: (body.role || 'স্টাফ').trim(),
+      destination: (body.destination || 'ফ্যাক্টরির বাহিরে').trim(),
+      purpose: (body.rawPurpose || body.purpose || '').trim(),
+      outTime: body.outTime || nowDhaka,
+      returnTime: retTime,
       isReturned: true,
-      stops: req.body.stops || [],
-      latitude: req.body.latitude || null,
-      longitude: req.body.longitude || null,
-      phone: req.body.phone || null,
+      stops: body.stops || [],
+      latitude: body.latitude || null,
+      longitude: body.longitude || null,
+      phone: body.phone || null,
       createdAt: new Date().toISOString()
     };
     movements.unshift(record);
   } else {
     record = movements[index];
     record.isReturned = true;
-    record.returnTime = req.body.returnTime || new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true });
-    if (req.body.name) record.name = req.body.name;
-    if (req.body.destination) record.destination = req.body.destination;
-    if (req.body.purpose) record.purpose = req.body.purpose;
+    record.returnTime = retTime;
+    if (body.name) record.name = body.name.trim();
+    if (body.role) record.role = body.role.trim();
+    if (body.destination) record.destination = body.destination.trim();
+    if (body.rawPurpose || body.purpose) record.purpose = (body.rawPurpose || body.purpose).trim();
+    if (body.phone) record.phone = body.phone;
+    if (body.stops) record.stops = body.stops;
   }
 
   // PRIVACY FIRST: Immediately delete active GPS track when returned!
@@ -248,7 +279,17 @@ app.post('/api/movements/:id/return', (req, res) => {
 
   forwardToGoogleSheets(record, 'RETURNED');
 
+  console.log(`[RETURN SAVED] ${record.name} returned at ${record.returnTime}`);
   res.json(record);
+});
+
+// Clear all movements endpoint
+app.delete('/api/movements', (req, res) => {
+  movements = [];
+  activeLocations.clear();
+  saveMovements();
+  io.emit('movements_cleared');
+  res.json({ success: true, message: 'All movements cleared' });
 });
 
 // 3b. Batch sync endpoint
@@ -310,6 +351,36 @@ app.delete('/api/movements/:id', (req, res) => {
 
   io.emit('movement_deleted', { id });
   res.json({ success: true, id });
+});
+
+// App Update Endpoints
+let appUpdateConfig = {
+  latestVersionCode: 8,
+  latestVersionName: "1.7",
+  downloadUrl: "https://movement-tracker-server.onrender.com/download/apk",
+  updateNotes: "নতুন আপডেট: সার্ভার ও উভয় মোবাইলের লাইভ নোটিফিকেশন ও সিঙ্ক অপটিমাইজেশন।",
+  forceUpdate: false
+};
+
+app.get('/api/app-update', (req, res) => {
+  res.json(appUpdateConfig);
+});
+
+app.post('/api/app-update', (req, res) => {
+  if (req.body) {
+    appUpdateConfig = { ...appUpdateConfig, ...req.body };
+  }
+  res.json(appUpdateConfig);
+});
+
+app.get('/download/apk', (req, res) => {
+  const apkPath = path.join(__dirname, 'public', 'FactoryMovementTracker.apk');
+  res.download(apkPath, 'FactoryMovementTracker.apk', (err) => {
+    if (err) {
+      console.error('Download APK error:', err.message);
+      if (!res.headersSent) res.status(404).send('APK not found on server');
+    }
+  });
 });
 
 // 6. Real-time GPS Location Ping (Active ONLY while staff is outside!)
