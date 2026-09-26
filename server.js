@@ -140,39 +140,46 @@ app.get('/api/movements', (req, res) => {
   res.json(movements);
 });
 
-// 2. Add movement record
+// 2. Add or Upsert movement record
 app.post('/api/movements', (req, res) => {
-  const { name, role, destination, purpose, outTime, latitude, longitude } = req.body;
-  if (!name || !destination || !purpose) {
-    return res.status(400).json({ error: 'Name, destination, and purpose are required.' });
+  const { name, role, destination, purpose, outTime, latitude, longitude, id } = req.body;
+  if (!name || !destination) {
+    return res.status(400).json({ error: 'Name and destination are required.' });
   }
 
-  const newRecord = {
-    id: req.body.id || 'mov_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+  const recordId = id || 'mov_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+  const existingIndex = movements.findIndex(m => m.id === recordId);
+
+  const recordData = {
+    id: recordId,
     name: name.trim(),
     role: (role || 'স্টাফ').trim(),
     destination: destination.trim(),
-    purpose: purpose.trim(),
+    purpose: (purpose || '').trim(),
     outTime: outTime || new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true }),
-    returnTime: null,
-    isReturned: false,
+    returnTime: req.body.returnTime || null,
+    isReturned: Boolean(req.body.isReturned),
     stops: req.body.stops || [],
     latitude: latitude || null,
     longitude: longitude || null,
+    phone: req.body.phone || null,
     mapsUrl: latitude && longitude ? `https://maps.google.com/?q=${latitude},${longitude}` : null,
     createdAt: new Date().toISOString()
   };
 
-  movements.unshift(newRecord);
+  if (existingIndex !== -1) {
+    movements[existingIndex] = { ...movements[existingIndex], ...recordData };
+  } else {
+    movements.unshift(recordData);
+  }
   saveMovements();
 
-  // If GPS coordinates provided, add to active tracking
-  if (latitude && longitude) {
-    activeLocations.set(newRecord.id, {
-      movementId: newRecord.id,
-      staffName: newRecord.name,
-      role: newRecord.role,
-      destination: newRecord.destination,
+  if (latitude && longitude && !recordData.isReturned) {
+    activeLocations.set(recordId, {
+      movementId: recordId,
+      staffName: recordData.name,
+      role: recordData.role,
+      destination: recordData.destination,
       latitude,
       longitude,
       speed: 0,
@@ -180,31 +187,50 @@ app.post('/api/movements', (req, res) => {
     });
   }
 
-  // Real-time broadcast to all connected devices (workers & admin)
-  io.emit('movement_added', newRecord);
+  // Real-time broadcast to all connected devices
+  io.emit('movement_added', recordData);
   io.emit('notification', {
-    title: `🔔 নতুন মুভমেন্ট: ${newRecord.name} (${newRecord.role})`,
-    message: `গন্তব্য: ${newRecord.destination} (${newRecord.purpose})`,
-    recordId: newRecord.id
+    title: `🔔 নতুন মুভমেন্ট: ${recordData.name} (${recordData.role})`,
+    message: `গন্তব্য: ${recordData.destination} (${recordData.purpose})`,
+    recordId: recordData.id
   });
 
-  // Sync with Google Sheets
-  forwardToGoogleSheets(newRecord, 'NEW_ENTRY');
+  forwardToGoogleSheets(recordData, 'NEW_ENTRY');
 
-  res.status(201).json(newRecord);
+  res.status(201).json(recordData);
 });
 
-// 3. Mark movement as returned (Stops GPS tracking & respects privacy!)
+// 3. Mark movement as returned (Upserts if not already on server)
 app.post('/api/movements/:id/return', (req, res) => {
   const id = req.params.id;
   const index = movements.findIndex(m => m.id === id);
-  if (index === -1) {
-    return res.status(404).json({ error: 'Record not found' });
-  }
 
-  const record = movements[index];
-  record.isReturned = true;
-  record.returnTime = req.body.returnTime || new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true });
+  let record;
+  if (index === -1) {
+    record = {
+      id: id,
+      name: (req.body.name || 'কর্মী').trim(),
+      role: (req.body.role || 'স্টাফ').trim(),
+      destination: (req.body.destination || 'ফ্যাক্টরির বাহিরে').trim(),
+      purpose: (req.body.rawPurpose || req.body.purpose || '').trim(),
+      outTime: req.body.outTime || new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true }),
+      returnTime: req.body.returnTime || new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true }),
+      isReturned: true,
+      stops: req.body.stops || [],
+      latitude: req.body.latitude || null,
+      longitude: req.body.longitude || null,
+      phone: req.body.phone || null,
+      createdAt: new Date().toISOString()
+    };
+    movements.unshift(record);
+  } else {
+    record = movements[index];
+    record.isReturned = true;
+    record.returnTime = req.body.returnTime || new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true });
+    if (req.body.name) record.name = req.body.name;
+    if (req.body.destination) record.destination = req.body.destination;
+    if (req.body.purpose) record.purpose = req.body.purpose;
+  }
 
   // PRIVACY FIRST: Immediately delete active GPS track when returned!
   activeLocations.delete(id);
@@ -220,10 +246,32 @@ app.post('/api/movements/:id/return', (req, res) => {
     recordId: id
   });
 
-  // Sync to Google Sheets
   forwardToGoogleSheets(record, 'RETURNED');
 
   res.json(record);
+});
+
+// 3b. Batch sync endpoint
+app.post('/api/movements/sync', (req, res) => {
+  const incoming = Array.isArray(req.body) ? req.body : req.body.records || [];
+  let addedCount = 0;
+  for (const item of incoming) {
+    if (!item.id || !item.name) continue;
+    const idx = movements.findIndex(m => m.id === item.id);
+    if (idx === -1) {
+      movements.unshift(item);
+      addedCount++;
+    } else {
+      if (item.isReturned && !movements[idx].isReturned) {
+        movements[idx] = { ...movements[idx], ...item };
+      }
+    }
+  }
+  if (addedCount > 0) {
+    saveMovements();
+    io.emit('movement_added', movements[0]);
+  }
+  res.json({ success: true, count: movements.length, addedCount });
 });
 
 // 4. Add Next Stop
