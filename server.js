@@ -49,10 +49,10 @@ if (fs.existsSync(MOVEMENTS_FILE)) {
 }
 
 let appUpdateInfo = {
-  latestVersionCode: 4,
-  latestVersionName: '1.3',
-  downloadUrl: 'https://github.com/movement-tracker/releases/download/v1.3/FactoryMovementTracker.apk',
-  updateNotes: '১. রেন্ডার সেন্ট্রাল সার্ভার রিয়েলটাইম সিঙ্ক।\n২. অটোমেটিক জিপিএস লাইভ ট্র্যাকিং ও প্রাইভেসি প্রটেকশন।\n৩. রাত ৯টার অ্যাডমিন অ্যালার্ট।',
+  latestVersionCode: 10,
+  latestVersionName: '1.8',
+  downloadUrl: 'https://movement-tracker-server.onrender.com/download/apk',
+  updateNotes: '১. ১০০% লাইভ জিপিএস লোকেশন ট্র্যাকিং।\n২. ফিরে এলে অটোমেটিক ডিলিট।\n৩. নতুন মুভমেন্ট ও পরবর্তী স্টপ যোগে ভয়েস টু টেক্সট।\n৪. কন্টাক্ট থেকে নম্বর ও সরাসরি কল।',
   forceUpdate: false
 };
 
@@ -263,12 +263,14 @@ app.post('/api/movements/:id/return', (req, res) => {
     if (body.stops) record.stops = body.stops;
   }
 
-  // PRIVACY FIRST: Immediately delete active GPS track when returned!
+  // Remove returned staff from active movements list so it is immediately removed from everyone's app
+  movements = movements.filter(m => m.id !== id);
   activeLocations.delete(id);
 
   saveMovements();
 
   // Realtime Broadcast
+  io.emit('movement_deleted', { id });
   io.emit('movement_returned', record);
   io.emit('location_removed', { movementId: id });
   io.emit('notification', {
@@ -355,10 +357,10 @@ app.delete('/api/movements/:id', (req, res) => {
 
 // App Update Endpoints
 let appUpdateConfig = {
-  latestVersionCode: 8,
-  latestVersionName: "1.7",
+  latestVersionCode: 10,
+  latestVersionName: "1.8",
   downloadUrl: "https://movement-tracker-server.onrender.com/download/apk",
-  updateNotes: "নতুন আপডেট: সার্ভার ও উভয় মোবাইলের লাইভ নোটিফিকেশন ও সিঙ্ক অপটিমাইজেশন।",
+  updateNotes: "নতুন আপডেট (v1.8): ১০০% লাইভ লোকেশন ট্র্যাকিং, ফিরে এলে অটো ডিলিট, এবং সকল ফিল্ডে ভয়েস টু টেক্সট ফিচার।",
   forceUpdate: false
 };
 
